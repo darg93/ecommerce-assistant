@@ -1,18 +1,23 @@
-"""Module containing the shop assistant implementation."""
+"""Module containing the shop assistant implementation using OpenAI Assistants API."""
 
-from typing import Dict, List
+from typing import Dict
 import json
 from openai import OpenAI
 from src.product_catalog import get_product_info, check_stock
 
 class ShopAssistant:
     def __init__(self, api_key: str):
+        """Initialize the shop assistant with OpenAI API key."""
         self.client = OpenAI(api_key=api_key)
-        self.tools = self._define_tools()
+        self.assistant = self._create_assistant()
         
-    def _define_tools(self) -> List[Dict]:
-        return [
-            {
+    def _create_assistant(self):
+        """Create an OpenAI Assistant with product-related functions."""
+        return self.client.beta.assistants.create(
+            name="Shop Assistant",
+            instructions="You are a helpful e-commerce assistant. Provide concise but complete information about products.",
+            model="gpt-4o",
+            tools=[{
                 "type": "function",
                 "function": {
                     "name": "get_product_info",
@@ -45,62 +50,68 @@ class ShopAssistant:
                         "required": ["product_name"]
                     }
                 }
-            }
-        ]
+            }]
+        )
 
-    def _execute_function(self, function_name: str, arguments: Dict) -> Dict:
-        if function_name == "get_product_info":
+    def _execute_function(self, name: str, arguments: Dict) -> Dict:
+        """Execute the appropriate function based on the assistant's request."""
+        if name == "get_product_info":
             result = get_product_info(arguments["product_name"])
-        elif function_name == "check_stock":
+        elif name == "check_stock":
             result = check_stock(arguments["product_name"])
         else:
-            raise ValueError(f"Unknown function: {function_name}")
+            raise ValueError(f"Unknown function: {name}")
         return result if result else {"error": "Product not found"}
 
     async def process_message(self, user_message: str) -> str:
-        messages = [{
-            "role": "system",
-            "content": "You are a helpful e-commerce assistant. Provide concise but complete information about products."
-        },
-        {
-            "role": "user",
-            "content": user_message
-        }]
+        """Process user message using the assistant and handle any function calls."""
+        # Create a new thread for the conversation
+        thread = self.client.beta.threads.create()
         
-        # Initial API call
-        response = self.client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            tools=self.tools,
-            tool_choice="auto"
+        # Add the user's message to the thread
+        self.client.beta.threads.messages.create(
+            thread_id=thread.id,
+            role="user",
+            content=user_message
         )
         
-        assistant_message = response.choices[0].message
-        
-        # If no function calls needed
-        if not assistant_message.tool_calls:
-            return assistant_message.content
-        
-        # Handle function calls
-        messages.append(assistant_message)
-        
-        for tool_call in assistant_message.tool_calls:
-            function_name = tool_call.function.name
-            function_args = json.loads(tool_call.function.arguments)
-            
-            function_response = self._execute_function(function_name, function_args)
-            
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "name": function_name,
-                "content": json.dumps(function_response)
-            })
-        
-        # Get final response
-        final_response = self.client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages
+        # Create a run for the assistant
+        run = self.client.beta.threads.runs.create(
+            thread_id=thread.id,
+            assistant_id=self.assistant.id
         )
         
-        return final_response.choices[0].message.content
+        # Wait for the run to complete
+        while True:
+            run_status = self.client.beta.threads.runs.retrieve(
+                thread_id=thread.id,
+                run_id=run.id
+            )
+            
+            if run_status.status == "requires_action":
+                tool_outputs = []
+                for tool_call in run_status.required_action.submit_tool_outputs.tool_calls:
+                    function_name = tool_call.function.name
+                    arguments = json.loads(tool_call.function.arguments)
+                    result = self._execute_function(function_name, arguments)
+                    tool_outputs.append({
+                        "tool_call_id": tool_call.id,
+                        "output": json.dumps(result)
+                    })
+                
+                # Submit tool outputs back to the assistant
+                run = self.client.beta.threads.runs.submit_tool_outputs(
+                    thread_id=thread.id,
+                    run_id=run.id,
+                    tool_outputs=tool_outputs
+                )
+            
+            elif run_status.status == "completed":
+                break
+            
+            elif run_status.status in ["failed", "cancelled", "expired"]:
+                raise Exception(f"Run failed with status: {run_status.status}")
+        
+        # Get the assistant's response
+        messages = self.client.beta.threads.messages.list(thread_id=thread.id)
+        return messages.data[0].content[0].text.value
